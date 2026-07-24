@@ -1,18 +1,18 @@
-import streamlit as st
-import pandas as pd
-import requests
-from requests.auth import HTTPBasicAuth
-from urllib.parse import urlparse
-import os
 import mimetypes
-import time
+import os
 import re
-from io import BytesIO
+import tempfile
+import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import BytesIO
+from urllib.parse import urlparse
+
 import filetype
-import tempfile
-from pathlib import Path
+import pandas as pd
+import requests
+import streamlit as st
+from requests.auth import HTTPBasicAuth
 
 
 # -------------------------------------------------------
@@ -20,20 +20,29 @@ from pathlib import Path
 # -------------------------------------------------------
 
 def clean_generic(s):
-    """General cleaner: keep letters/numbers/dash/dot, drop everything else (spaces removed)."""
+    """General cleaner: keep letters/numbers/dash/dot, drop everything else."""
     s = str(s).strip()
-    return "".join(c for c in s if c.isalnum() or c in ('-', '.'))
+    return "".join(c for c in s if c.isalnum() or c in ("-", "."))
+
 
 def clean_store_id(s):
-    """STORE ID may already contain dashes -> keep them exactly as-is."""
+    """STORE ID may already contain dashes, so keep them exactly as-is."""
     s = str(s).strip()
-    return "".join(c for c in s if c.isalnum() or c in ('-', '.'))
+    return "".join(c for c in s if c.isalnum() or c in ("-", "."))
+
 
 def clean_store_name(s):
     """STORE NAME: replace spaces with a dash, keep alnum/dash/dot only."""
     s = str(s).strip()
-    s = re.sub(r'\s+', '-', s)
-    return "".join(c for c in s if c.isalnum() or c in ('-', '.'))
+    s = re.sub(r"\s+", "-", s)
+    return "".join(c for c in s if c.isalnum() or c in ("-", "."))
+
+
+def clean_folder_name(s):
+    """Keep the ZIP filename/folder name safe for Streamlit Cloud."""
+    cleaned = clean_store_name(s)
+    return cleaned or "images_downloaded"
+
 
 def detect_extension(content, content_type, url):
     """Detect proper file extension."""
@@ -42,16 +51,17 @@ def detect_extension(content, content_type, url):
         if kind:
             return kind.extension
         if content_type:
-            guessed = mimetypes.guess_extension(content_type.split(';')[0].strip())
+            guessed = mimetypes.guess_extension(content_type.split(";")[0].strip())
             if guessed:
-                return guessed.lstrip('.')
+                return guessed.lstrip(".")
         path = urlparse(url).path
         ext2 = os.path.splitext(path)[1]
         if ext2 and len(ext2) <= 6:
-            return ext2.lstrip('.')
-    except:
+            return ext2.lstrip(".")
+    except Exception:
         pass
-    return 'jpg'
+    return "jpg"
+
 
 def download_one(url, dest_name, folder, auth, timeout=30, max_retries=3):
     """Download a single file with retries."""
@@ -61,20 +71,22 @@ def download_one(url, dest_name, folder, auth, timeout=30, max_retries=3):
             with requests.Session() as session:
                 session.auth = auth
                 session.headers.update({
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36"
+                    )
                 })
-                resp = session.get(url, stream=True, timeout=timeout)
+                resp = session.get(url, timeout=timeout)
                 if resp.status_code == 200:
                     content = resp.content
-                    content_type = resp.headers.get('Content-Type', '')
+                    content_type = resp.headers.get("Content-Type", "")
                     ext = detect_extension(content, content_type, url)
                     final_name = f"{dest_name}.{ext}"
                     final_path = os.path.join(folder, final_name)
-                    with open(final_path, 'wb') as f:
+                    with open(final_path, "wb") as f:
                         f.write(content)
                     return True, final_name, None
-                else:
-                    last_exc = f'HTTP {resp.status_code}'
+                last_exc = f"HTTP {resp.status_code}"
         except Exception as e:
             last_exc = str(e)
         if attempt < max_retries:
@@ -82,53 +94,62 @@ def download_one(url, dest_name, folder, auth, timeout=30, max_retries=3):
     return False, None, last_exc
 
 
+def reset_download_state():
+    st.session_state.zip_data = None
+    st.session_state.failed_csv_data = None
+    st.session_state.download_summary = None
+
+
 # -------------------------------------------------------
 # Streamlit App
 # -------------------------------------------------------
 
 st.set_page_config(page_title="KOBO Image Downloader", layout="wide")
-st.title("📊 Download images from KOBO")
+st.title("Download images from KOBO")
 st.write("This app downloads images from KOBO using the PEP LINK column.")
 
-# Sidebar for instructions
 with st.sidebar:
     st.markdown("### Instructions")
     st.write("Required columns: **PEP LINK, CITY, STORE ID, STORE NAME, ID**")
     st.write("Image file name pattern: `CITY_STOREID_STORE-NAME_ID`")
-    st.write("- STORE NAME: spaces become dashes (e.g. `Al Fateh Store` → `Al-Fateh-Store`)")
+    st.write("- STORE NAME: spaces become dashes (e.g. `Al Fateh Store` -> `Al-Fateh-Store`)")
     st.write("- STORE ID: kept exactly as-is")
 
-# Main content
-username = st.text_input('Kobo Username', '')
-password = st.text_input('Kobo Password', type='password')
+username = st.text_input("Kobo Username", "")
+password = st.text_input("Kobo Password", type="password")
 
-# Download settings
 col1, col2, col3 = st.columns(3)
 with col1:
-    concurrency = st.slider('Concurrent downloads', min_value=1, max_value=5, value=3)
+    concurrency = st.slider("Concurrent downloads", min_value=1, max_value=5, value=3)
 with col2:
-    timeout = st.number_input('Request timeout (seconds)', value=30, min_value=10, max_value=120)
+    timeout = st.number_input("Request timeout (seconds)", value=30, min_value=10, max_value=120)
 with col3:
-    max_retries = st.number_input('Max retries per URL', value=3, min_value=0, max_value=5)
+    max_retries = st.number_input("Max retries per URL", value=3, min_value=0, max_value=5)
 
 uploaded_file = st.file_uploader(
-    'Upload Excel or CSV file with links',
-    type=['xlsx', 'xls', 'csv']
+    "Upload Excel or CSV file with links",
+    type=["xlsx", "xls", "csv"],
 )
 
 REQUIRED_COLS = ["PEP LINK", "CITY", "STORE ID", "STORE NAME", "ID"]
 
+if "zip_data" not in st.session_state:
+    st.session_state.zip_data = None
+if "failed_csv_data" not in st.session_state:
+    st.session_state.failed_csv_data = None
+if "download_summary" not in st.session_state:
+    st.session_state.download_summary = None
+
 if uploaded_file is not None and username and password:
     try:
-        if uploaded_file.name.endswith(('.xls', '.xlsx')):
-            df = pd.read_excel(uploaded_file, engine='openpyxl')
+        if uploaded_file.name.endswith((".xls", ".xlsx")):
+            df = pd.read_excel(uploaded_file, engine="openpyxl")
         else:
             df = pd.read_csv(uploaded_file)
-        
-        # Clean column names
+
         df.columns = [str(c).strip() for c in df.columns]
-        
-        st.markdown('**Preview of file**')
+
+        st.markdown("**Preview of file**")
         st.dataframe(df.head(50))
 
         missing = [c for c in REQUIRED_COLS if c not in df.columns]
@@ -136,22 +157,22 @@ if uploaded_file is not None and username and password:
             st.error(f"Error: Missing required column(s): {', '.join(missing)}")
             st.stop()
 
-        folder_name = st.text_input('Folder name for images', value='images_downloaded')
+        folder_name = st.text_input("Folder name for images", value="images_downloaded")
 
-        if st.button('🚀 Start download', type='primary'):
+        if st.button("Start download", type="primary"):
+            reset_download_state()
             with st.spinner("Processing downloads..."):
-                # Create temporary directory
                 with tempfile.TemporaryDirectory() as temp_dir:
                     try:
                         auth = HTTPBasicAuth(username, password)
-                        download_folder = os.path.join(temp_dir, folder_name)
+                        safe_folder_name = clean_folder_name(folder_name)
+                        download_folder = os.path.join(temp_dir, safe_folder_name)
                         os.makedirs(download_folder, exist_ok=True)
 
-                        # Prepare tasks
                         tasks = []
                         for _, row in df.iterrows():
                             url = str(row["PEP LINK"]).strip()
-                            if not url.startswith(('http://', 'https://')):
+                            if not url.startswith(("http://", "https://")):
                                 continue
 
                             city = clean_generic(row["CITY"])
@@ -169,18 +190,22 @@ if uploaded_file is not None and username and password:
                             st.warning("No valid URLs found to download.")
                             st.stop()
 
-                        # Track progress
                         progress_bar = st.progress(0)
                         status_text = st.empty()
                         results = []
                         total = len(tasks)
                         done = 0
 
-                        # Download with ThreadPool
                         with ThreadPoolExecutor(max_workers=concurrency) as executor:
                             future_to_task = {
                                 executor.submit(
-                                    download_one, url, dest_name, city_folder, auth, timeout, max_retries
+                                    download_one,
+                                    url,
+                                    dest_name,
+                                    city_folder,
+                                    auth,
+                                    timeout,
+                                    max_retries,
                                 ): (url, city)
                                 for url, dest_name, city_folder, city in tasks
                             }
@@ -188,65 +213,77 @@ if uploaded_file is not None and username and password:
                             for future in as_completed(future_to_task):
                                 url, city = future_to_task[future]
                                 try:
-                                    success, final_name, error = future.result(timeout=timeout+10)
+                                    success, final_name, error = future.result(timeout=timeout + 10)
                                 except Exception as e:
                                     success, final_name, error = False, None, str(e)
-                                
+
                                 done += 1
                                 progress_bar.progress(done / total)
                                 status_text.text(f"Downloading {done}/{total} images...")
-                                
+
                                 if success:
                                     results.append((url, os.path.join(city, final_name), True, None))
                                 else:
                                     results.append((url, None, False, error))
 
-                        # Show results
                         succ = sum(1 for r in results if r[2])
                         fail = sum(1 for r in results if not r[2])
-                        
-                        st.success(f"✅ Download complete! Successful: {succ}, Failed: {fail}")
 
-                        # Create ZIP if any successful downloads
+                        st.session_state.download_summary = (succ, fail)
+                        st.success(f"Download complete! Successful: {succ}, Failed: {fail}")
+
                         if succ > 0:
                             zip_buffer = BytesIO()
-                            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
                                 for _, fname, ok, _ in results:
                                     if ok and fname:
                                         fpath = os.path.join(download_folder, fname)
                                         if os.path.exists(fpath):
                                             arcname = os.path.relpath(fpath, download_folder)
                                             zipf.write(fpath, arcname)
-                            
-                            zip_buffer.seek(0)
-                            st.download_button(
-                                "📥 Download All Images (ZIP)",
-                                data=zip_buffer,
-                                file_name=f"{folder_name}.zip",
-                                mime="application/zip",
-                                use_container_width=True
-                            )
 
-                        # Show failed links
+                            st.session_state.zip_data = {
+                                "bytes": zip_buffer.getvalue(),
+                                "file_name": f"{safe_folder_name}.zip",
+                            }
+
                         if fail > 0:
                             failed_data = []
                             for url, _, ok, error in results:
                                 if not ok:
-                                    failed_data.append({'url': url, 'error': error})
+                                    failed_data.append({"url": url, "error": error})
                             fail_df = pd.DataFrame(failed_data)
-                            csv_buffer = BytesIO()
-                            fail_df.to_csv(csv_buffer, index=False)
-                            st.download_button(
-                                '📄 Download Failed Links CSV',
-                                data=csv_buffer.getvalue(),
-                                file_name='failed_links.csv',
-                                mime='text/csv',
-                                use_container_width=True
-                            )
+                            st.session_state.failed_csv_data = fail_df.to_csv(index=False).encode("utf-8")
 
                     except Exception as e:
                         st.error(f"Error during download: {str(e)}")
                         st.exception(e)
 
+        if st.session_state.download_summary:
+            succ, fail = st.session_state.download_summary
+            st.success(f"Ready to download. Successful: {succ}, Failed: {fail}")
+
+        if st.session_state.zip_data:
+            st.download_button(
+                "Download All Images (ZIP)",
+                data=st.session_state.zip_data["bytes"],
+                file_name=st.session_state.zip_data["file_name"],
+                mime="application/zip",
+                use_container_width=True,
+            )
+
+        if st.session_state.failed_csv_data:
+            st.download_button(
+                "Download Failed Links CSV",
+                data=st.session_state.failed_csv_data,
+                file_name="failed_links.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+    except Exception as e:
+        st.error(f"Error reading file: {str(e)}")
+        st.exception(e)
+
 else:
-    st.info('📤 Upload a file and enter your Kobo credentials to begin.')
+    st.info("Upload a file and enter your Kobo credentials to begin.")
