@@ -8,6 +8,7 @@ from io import BytesIO
 from urllib.parse import urlparse
 import time
 import gc
+import sys
 
 import filetype
 import pandas as pd
@@ -95,7 +96,7 @@ def build_session(auth, pool_size, max_retries):
     return session
 
 
-def download_one(session, url, dest_name, folder, timeout=30, chunk_size=1024 * 128):
+def download_one(session, url, dest_name, folder, timeout=30, chunk_size=1024 * 64):
     """
     Download a single file, streaming it straight to disk instead of loading
     the whole image into memory first. This keeps per-thread memory usage
@@ -103,14 +104,13 @@ def download_one(session, url, dest_name, folder, timeout=30, chunk_size=1024 * 
     """
     tmp_path = os.path.join(folder, f"{dest_name}.part")
     try:
-        # Add a small delay to prevent overwhelming the server
         with session.get(url, timeout=timeout, stream=True) as resp:
             if resp.status_code != 200:
                 return False, None, f"HTTP {resp.status_code}"
 
             content_type = resp.headers.get("Content-Type", "")
             first_chunk = b""
-            # Use a larger chunk size for better performance
+            file_size = 0
             with open(tmp_path, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=chunk_size):
                     if not chunk:
@@ -118,8 +118,9 @@ def download_one(session, url, dest_name, folder, timeout=30, chunk_size=1024 * 
                     if not first_chunk and len(first_chunk) < 8192:
                         first_chunk += chunk[:8192]
                     f.write(chunk)
-                    # Force flush to disk periodically
-                    if f.tell() > 1024 * 1024:  # Every 1MB
+                    file_size += len(chunk)
+                    # Force flush periodically to prevent memory buildup
+                    if file_size % (1024 * 1024) == 0:  # Every 1MB
                         f.flush()
 
             ext = detect_extension(first_chunk, content_type, url)
@@ -155,59 +156,52 @@ def zip_folder_to_bytes(folder_path, max_files=50000):
     return buf.getvalue()
 
 
-def process_batch_in_chunks(tasks, session, concurrency, timeout, download_folder, max_chunk_size=500):
+def process_batch(batch_tasks, session, concurrency, timeout, download_folder, progress_callback=None):
     """
-    Process downloads in smaller chunks to avoid memory overload.
-    This is the key improvement for handling 1000+ images.
+    Process a batch of downloads with progress tracking.
     """
     results = []
-    total_tasks = len(tasks)
+    successful = 0
+    failed = 0
     
-    for chunk_start in range(0, total_tasks, max_chunk_size):
-        chunk_end = min(chunk_start + max_chunk_size, total_tasks)
-        chunk_tasks = tasks[chunk_start:chunk_end]
-        
-        st.info(f"Processing batch {chunk_start//max_chunk_size + 1}/{(total_tasks + max_chunk_size - 1)//max_chunk_size} ({chunk_end - chunk_start} images)")
-        
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            future_to_task = {
-                executor.submit(
-                    download_one,
-                    session,
-                    url,
-                    dest_name,
-                    download_folder,
-                    timeout,
-                ): (url, city, dest_name)
-                for url, dest_name, _, city in chunk_tasks
-            }
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        future_to_task = {
+            executor.submit(
+                download_one,
+                session,
+                url,
+                dest_name,
+                download_folder,
+                timeout,
+            ): (url, city, dest_name)
+            for url, dest_name, _, city in batch_tasks
+        }
 
-            for future in as_completed(future_to_task):
-                url, city, dest_name = future_to_task[future]
-                try:
-                    success, final_name, error = future.result(timeout=timeout + 15)
-                except Exception as e:
-                    success, final_name, error = False, None, str(e)
+        for future in as_completed(future_to_task):
+            url, city, dest_name = future_to_task[future]
+            try:
+                success, final_name, error = future.result(timeout=timeout + 15)
+            except Exception as e:
+                success, final_name, error = False, None, str(e)
 
-                if success:
-                    results.append((url, city, True, None))
-                else:
-                    results.append((url, city, False, error))
-        
-        # Force garbage collection after each chunk
-        gc.collect()
-        
-        # Small delay between chunks to let system resources recover
-        if chunk_end < total_tasks:
-            time.sleep(0.5)
+            if success:
+                successful += 1
+                results.append((url, city, True, None))
+            else:
+                failed += 1
+                results.append((url, city, False, error))
+            
+            if progress_callback:
+                progress_callback(successful, failed)
     
-    return results
+    return results, successful, failed
 
 
 def reset_download_state():
     st.session_state.zip_data = None
     st.session_state.failed_csv_data = None
     st.session_state.download_summary = None
+    st.session_state.progress_data = None
 
 
 # -------------------------------------------------------
@@ -224,6 +218,9 @@ with st.sidebar:
     st.write("Image file name pattern: `CITY_STOREID_STORE-NAME_ID`")
     st.write("- STORE NAME: spaces become dashes (e.g. `Al Fateh Store` -> `Al-Fateh-Store`)")
     st.write("- STORE ID: kept exactly as-is")
+    
+    st.markdown("### Performance Settings")
+    st.warning("For large downloads (>1000 images), use lower settings to avoid crashes")
 
 
 username = st.text_input("Kobo Username", "")
@@ -231,13 +228,13 @@ password = st.text_input("Kobo Password", type="password")
 
 col1, col2, col3, col4 = st.columns(4)
 with col1:
-    concurrency = st.slider("Concurrent downloads", min_value=1, max_value=8, value=3, help="Lower for large batches to prevent crashes")
+    concurrency = st.slider("Concurrent downloads", min_value=1, max_value=5, value=2, help="Lower for large batches to prevent crashes")
 with col2:
     timeout = st.number_input("Request timeout (seconds)", value=30, min_value=10, max_value=120)
 with col3:
     max_retries = st.number_input("Max retries per URL", value=3, min_value=0, max_value=5)
 with col4:
-    batch_size = st.slider("Batch size", min_value=50, max_value=500, value=200, help="Process images in smaller batches to avoid memory issues")
+    batch_size = st.slider("Batch size", min_value=50, max_value=300, value=100, help="Process images in smaller batches to avoid memory issues")
 
 uploaded_file = st.file_uploader(
     "Upload Excel or CSV file with links",
@@ -252,15 +249,19 @@ if "failed_csv_data" not in st.session_state:
     st.session_state.failed_csv_data = None
 if "download_summary" not in st.session_state:
     st.session_state.download_summary = None
+if "progress_data" not in st.session_state:
+    st.session_state.progress_data = None
 
 if uploaded_file is not None and username and password:
     try:
-        if uploaded_file.name.endswith((".xls", ".xlsx")):
-            df = pd.read_excel(uploaded_file, engine="openpyxl")
-        else:
-            df = pd.read_csv(uploaded_file)
+        # Show file reading progress
+        with st.spinner("Reading file..."):
+            if uploaded_file.name.endswith((".xls", ".xlsx")):
+                df = pd.read_excel(uploaded_file, engine="openpyxl")
+            else:
+                df = pd.read_csv(uploaded_file)
 
-        df.columns = [str(c).strip() for c in df.columns]
+            df.columns = [str(c).strip() for c in df.columns]
 
         st.markdown("**Preview of file**")
         st.dataframe(df.head(50))
@@ -275,6 +276,10 @@ if uploaded_file is not None and username and password:
 
         if st.button("Start download", type="primary"):
             reset_download_state()
+            
+            # Create a placeholder for progress updates
+            progress_placeholder = st.empty()
+            status_placeholder = st.empty()
             
             # Show a progress spinner
             with st.spinner("Processing downloads..."):
@@ -292,8 +297,7 @@ if uploaded_file is not None and username and password:
                         skipped_rows = 0
                         
                         # Show progress for task preparation
-                        status_text = st.empty()
-                        status_text.text("Preparing download tasks...")
+                        status_placeholder.text("Preparing download tasks...")
                         
                         for idx, row in df.iterrows():
                             url = str(row["PEP LINK"]).strip()
@@ -311,9 +315,9 @@ if uploaded_file is not None and username and password:
                             
                             # Update status occasionally
                             if idx % 500 == 0 and idx > 0:
-                                status_text.text(f"Preparing tasks: {idx+1}/{len(df)}")
+                                status_placeholder.text(f"Preparing tasks: {idx+1}/{len(df)}")
 
-                        status_text.empty()
+                        status_placeholder.empty()
 
                         if skipped_rows:
                             st.warning(f"Skipped {skipped_rows} row(s) with missing/invalid PEP LINK.")
@@ -323,123 +327,148 @@ if uploaded_file is not None and username and password:
                             st.stop()
 
                         # Create progress bars
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
+                        total_tasks = len(tasks)
+                        progress_bar = progress_placeholder.progress(0)
+                        status_text = status_placeholder.text("Starting downloads...")
                         
-                        # Process downloads in chunks
-                        total = len(tasks)
-                        results = []
-                        successful_downloads = 0
-                        failed_downloads = 0
+                        # Initialize counters
+                        total_successful = 0
+                        total_failed = 0
+                        all_results = []
                         
                         # Process in chunks
-                        for chunk_start in range(0, total, batch_size):
-                            chunk_end = min(chunk_start + batch_size, total)
+                        chunk_count = 0
+                        total_chunks = (total_tasks + batch_size - 1) // batch_size
+                        
+                        for chunk_start in range(0, total_tasks, batch_size):
+                            chunk_end = min(chunk_start + batch_size, total_tasks)
                             chunk_tasks = tasks[chunk_start:chunk_end]
+                            chunk_count += 1
                             
-                            chunk_num = chunk_start // batch_size + 1
-                            total_chunks = (total + batch_size - 1) // batch_size
-                            status_text.text(f"Processing batch {chunk_num}/{total_chunks} ({chunk_end - chunk_start} images)")
+                            status_text.text(f"Processing batch {chunk_count}/{total_chunks} ({chunk_end - chunk_start} images)")
                             
-                            with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                                future_to_task = {
-                                    executor.submit(
-                                        download_one,
-                                        session,
-                                        url,
-                                        dest_name,
-                                        download_folder,
-                                        timeout,
-                                    ): (url, city, dest_name, idx + chunk_start)
-                                    for idx, (url, dest_name, _, city) in enumerate(chunk_tasks)
-                                }
-
-                                for future in as_completed(future_to_task):
-                                    url, city, dest_name, task_idx = future_to_task[future]
-                                    try:
-                                        success, final_name, error = future.result(timeout=timeout + 15)
-                                    except Exception as e:
-                                        success, final_name, error = False, None, str(e)
-
-                                    if success:
-                                        successful_downloads += 1
-                                        results.append((url, city, True, None))
-                                    else:
-                                        failed_downloads += 1
-                                        results.append((url, city, False, error))
-                                    
-                                    # Update progress
-                                    completed = successful_downloads + failed_downloads
-                                    progress_bar.progress(completed / total)
-                                    status_text.text(f"Downloaded {completed}/{total} images (Success: {successful_downloads}, Failed: {failed_downloads})")
+                            # Process the batch
+                            batch_results, batch_success, batch_failed = process_batch(
+                                chunk_tasks, 
+                                session, 
+                                concurrency, 
+                                timeout, 
+                                download_folder,
+                                progress_callback=lambda s, f: None  # We'll handle progress externally
+                            )
+                            
+                            # Update totals
+                            total_successful += batch_success
+                            total_failed += batch_failed
+                            all_results.extend(batch_results)
+                            
+                            # Update progress
+                            completed = total_successful + total_failed
+                            progress_bar.progress(min(completed / total_tasks, 1.0))
+                            status_text.text(f"Downloaded {completed}/{total_tasks} images (Success: {total_successful}, Failed: {total_failed})")
                             
                             # Force garbage collection after each chunk
                             gc.collect()
                             
-                            # Small delay between chunks
-                            if chunk_end < total:
+                            # Small delay between chunks to let system resources recover
+                            if chunk_end < total_tasks:
                                 time.sleep(0.5)
+                            
+                            # Check if we're approaching memory limits
+                            if completed > 0 and completed % 500 == 0:
+                                # Force a memory cleanup
+                                gc.collect()
+                                # Update progress bar more frequently for large batches
+                                progress_bar.progress(min(completed / total_tasks, 1.0))
 
                         session.close()
 
-                        st.session_state.download_summary = (successful_downloads, failed_downloads)
-                        st.success(f"Download complete! Successful: {successful_downloads}, Failed: {failed_downloads}")
+                        st.session_state.download_summary = (total_successful, total_failed)
+                        
+                        # Show success message
+                        if total_successful > 0:
+                            st.success(f"✅ Download complete! Successful: {total_successful}, Failed: {total_failed}")
+                        else:
+                            st.error(f"❌ Download failed! All {total_failed} downloads failed.")
 
-                        if successful_downloads > 0:
-                            # Show zipping progress
+                        # Create ZIP file if there are successful downloads
+                        if total_successful > 0:
                             status_text.text("Creating ZIP file...")
-                            zip_bytes = zip_folder_to_bytes(download_folder)
-                            st.session_state.zip_data = {
-                                "bytes": zip_bytes,
-                                "file_name": f"{safe_folder_name}.zip",
-                            }
-                            status_text.text("ZIP file created!")
+                            try:
+                                zip_bytes = zip_folder_to_bytes(download_folder)
+                                st.session_state.zip_data = {
+                                    "bytes": zip_bytes,
+                                    "file_name": f"{safe_folder_name}.zip",
+                                }
+                                status_text.text("✅ ZIP file created successfully!")
+                            except MemoryError:
+                                st.error("⚠️ ZIP file creation failed due to memory limits. Try downloading fewer images at once or use a smaller batch size.")
+                            except Exception as e:
+                                st.error(f"⚠️ Error creating ZIP file: {str(e)}")
 
-                        if failed_downloads > 0:
+                        # Create failed links CSV if there were failures
+                        if total_failed > 0:
                             failed_data = [
                                 {"url": url, "city": city, "error": error}
-                                for url, city, ok, error in results
+                                for url, city, ok, error in all_results
                                 if not ok
                             ]
-                            fail_df = pd.DataFrame(failed_data)
-                            st.session_state.failed_csv_data = fail_df.to_csv(index=False).encode("utf-8")
+                            if failed_data:
+                                fail_df = pd.DataFrame(failed_data)
+                                st.session_state.failed_csv_data = fail_df.to_csv(index=False).encode("utf-8")
 
+                        # Clear progress indicators
+                        status_text.text("Processing complete!")
+                        
+                    except MemoryError:
+                        st.error("⚠️ Memory limit exceeded! Please try with fewer images or smaller batch size.")
+                        st.info("Suggestions: Reduce batch size to 50, reduce concurrent downloads to 1-2, and try again.")
+                    except TimeoutError:
+                        st.error("⏰ Operation timed out! Please try with a smaller batch or reduce the number of images.")
                     except Exception as e:
-                        st.error(f"Error during download: {str(e)}")
+                        st.error(f"❌ Error during download: {str(e)}")
                         st.exception(e)
                     finally:
                         # Clean up any temporary files
                         try:
                             import shutil
-                            shutil.rmtree(temp_dir, ignore_errors=True)
+                            if os.path.exists(temp_dir):
+                                shutil.rmtree(temp_dir, ignore_errors=True)
                         except:
                             pass
 
+        # Display download buttons if available
         if st.session_state.download_summary:
             succ, fail = st.session_state.download_summary
-            st.info(f"Last run — Successful: {succ}, Failed: {fail}")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.info(f"📊 Last run — Successful: {succ}, Failed: {fail}")
 
         if st.session_state.zip_data:
-            st.download_button(
-                "Download All Images (ZIP)",
-                data=st.session_state.zip_data["bytes"],
-                file_name=st.session_state.zip_data["file_name"],
-                mime="application/zip",
-                use_container_width=True,
-            )
+            col1, col2 = st.columns(2)
+            with col1:
+                st.download_button(
+                    "📥 Download All Images (ZIP)",
+                    data=st.session_state.zip_data["bytes"],
+                    file_name=st.session_state.zip_data["file_name"],
+                    mime="application/zip",
+                    use_container_width=True,
+                )
 
         if st.session_state.failed_csv_data:
-            st.download_button(
-                "Download Failed Links CSV",
-                data=st.session_state.failed_csv_data,
-                file_name="failed_links.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+            col1, col2 = st.columns(2)
+            with col2:
+                st.download_button(
+                    "📄 Download Failed Links CSV",
+                    data=st.session_state.failed_csv_data,
+                    file_name="failed_links.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
 
     except Exception as e:
-        st.error(f"Error reading file: {str(e)}")
+        st.error(f"❌ Error reading file: {str(e)}")
         st.exception(e)
 
 else:
-    st.info("Upload a file and enter your Kobo credentials to begin.")
+    st.info("📤 Upload a file and enter your Kobo credentials to begin.")
