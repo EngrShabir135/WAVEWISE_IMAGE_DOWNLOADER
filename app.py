@@ -2,7 +2,6 @@ import mimetypes
 import os
 import re
 import tempfile
-import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
@@ -12,7 +11,9 @@ import filetype
 import pandas as pd
 import requests
 import streamlit as st
+from requests.adapters import HTTPAdapter
 from requests.auth import HTTPBasicAuth
+from urllib3.util.retry import Retry
 
 
 # -------------------------------------------------------
@@ -44,10 +45,10 @@ def clean_folder_name(s):
     return cleaned or "images_downloaded"
 
 
-def detect_extension(content, content_type, url):
-    """Detect proper file extension."""
+def detect_extension(first_bytes, content_type, url):
+    """Detect proper file extension from the first chunk of bytes we already have."""
     try:
-        kind = filetype.guess(content)
+        kind = filetype.guess(first_bytes) if first_bytes else None
         if kind:
             return kind.extension
         if content_type:
@@ -63,39 +64,86 @@ def detect_extension(content, content_type, url):
     return "jpg"
 
 
-def download_one(url, dest_name, folder, auth, timeout=30, max_retries=3):
-    """Download a single file with retries."""
-    last_exc = None
-    for attempt in range(max_retries + 1):
-        try:
-            with requests.Session() as session:
-                session.auth = auth
-                session.headers.update({
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36"
-                    )
-                })
-                resp = session.get(url, timeout=timeout)
-                if resp.status_code == 200:
-                    content = resp.content
-                    content_type = resp.headers.get("Content-Type", "")
-                    ext = detect_extension(content, content_type, url)
-                    final_name = f"{dest_name}.{ext}"
-                    final_path = os.path.join(folder, final_name)
-                    with open(final_path, "wb") as f:
-                        f.write(content)
-                    return True, final_name, None
-                last_exc = f"HTTP {resp.status_code}"
-        except Exception as e:
-            last_exc = str(e)
-        if attempt < max_retries:
-            time.sleep(1 * (attempt + 1))
-    return False, None, last_exc
+def build_session(auth, pool_size, max_retries):
+    """
+    One shared Session (with connection pooling + automatic retries) reused by
+    every worker thread, instead of opening a brand-new Session per file.
+    This is the single biggest fix for crashes that only appear with large
+    link lists: without it, large batches open thousands of separate
+    connections and exhaust sockets / file descriptors.
+    """
+    session = requests.Session()
+    session.auth = auth
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        )
+    })
+    retry = Retry(
+        total=max_retries,
+        connect=max_retries,
+        read=max_retries,
+        backoff_factor=1.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET"]),
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=pool_size, pool_maxsize=pool_size)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def download_one(session, url, dest_name, folder, timeout=30):
+    """
+    Download a single file, streaming it straight to disk instead of loading
+    the whole image into memory first. This keeps per-thread memory usage
+    small and constant no matter how many files are being downloaded overall.
+    """
+    tmp_path = os.path.join(folder, f"{dest_name}.part")
+    try:
+        with session.get(url, timeout=timeout, stream=True) as resp:
+            if resp.status_code != 200:
+                return False, None, f"HTTP {resp.status_code}"
+
+            content_type = resp.headers.get("Content-Type", "")
+            first_chunk = b""
+            with open(tmp_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1024 * 64):
+                    if not chunk:
+                        continue
+                    if not first_chunk:
+                        first_chunk = chunk
+                    f.write(chunk)
+
+            ext = detect_extension(first_chunk, content_type, url)
+            final_name = f"{dest_name}.{ext}"
+            final_path = os.path.join(folder, final_name)
+            os.replace(tmp_path, final_path)
+            return True, final_name, None
+    except Exception as e:
+        # Make sure a half-written temp file never lingers or gets zipped by mistake
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        return False, None, str(e)
+
+
+def zip_folder_to_bytes(folder_path):
+    """Zip a folder's contents into an in-memory buffer and return the bytes."""
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for root, _dirs, files in os.walk(folder_path):
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                arcname = os.path.relpath(fpath, folder_path)
+                zipf.write(fpath, arcname)
+    return buf.getvalue()
 
 
 def reset_download_state():
-    st.session_state.zip_data = None
+    st.session_state.city_zips = None
     st.session_state.failed_csv_data = None
     st.session_state.download_summary = None
 
@@ -114,13 +162,21 @@ with st.sidebar:
     st.write("Image file name pattern: `CITY_STOREID_STORE-NAME_ID`")
     st.write("- STORE NAME: spaces become dashes (e.g. `Al Fateh Store` -> `Al-Fateh-Store`)")
     st.write("- STORE ID: kept exactly as-is")
+    st.markdown("---")
+    st.markdown(
+        "**Why one ZIP per city?**\n\n"
+        "For large files lists, building a single giant ZIP holds every image "
+        "in memory at once and can crash the app. Splitting into one ZIP per "
+        "city keeps memory usage bounded and lets you download results for "
+        "cities that finished even if something goes wrong with another one."
+    )
 
 username = st.text_input("Kobo Username", "")
 password = st.text_input("Kobo Password", type="password")
 
 col1, col2, col3 = st.columns(3)
 with col1:
-    concurrency = st.slider("Concurrent downloads", min_value=1, max_value=5, value=3)
+    concurrency = st.slider("Concurrent downloads", min_value=1, max_value=10, value=5)
 with col2:
     timeout = st.number_input("Request timeout (seconds)", value=30, min_value=10, max_value=120)
 with col3:
@@ -133,8 +189,8 @@ uploaded_file = st.file_uploader(
 
 REQUIRED_COLS = ["PEP LINK", "CITY", "STORE ID", "STORE NAME", "ID"]
 
-if "zip_data" not in st.session_state:
-    st.session_state.zip_data = None
+if "city_zips" not in st.session_state:
+    st.session_state.city_zips = None
 if "failed_csv_data" not in st.session_state:
     st.session_state.failed_csv_data = None
 if "download_summary" not in st.session_state:
@@ -151,6 +207,7 @@ if uploaded_file is not None and username and password:
 
         st.markdown("**Preview of file**")
         st.dataframe(df.head(50))
+        st.caption(f"Total rows in file: {len(df)}")
 
         missing = [c for c in REQUIRED_COLS if c not in df.columns]
         if missing:
@@ -169,13 +226,17 @@ if uploaded_file is not None and username and password:
                         download_folder = os.path.join(temp_dir, safe_folder_name)
                         os.makedirs(download_folder, exist_ok=True)
 
+                        session = build_session(auth, pool_size=concurrency, max_retries=max_retries)
+
                         tasks = []
+                        skipped_rows = 0
                         for _, row in df.iterrows():
                             url = str(row["PEP LINK"]).strip()
                             if not url.startswith(("http://", "https://")):
+                                skipped_rows += 1
                                 continue
 
-                            city = clean_generic(row["CITY"])
+                            city = clean_generic(row["CITY"]) or "unknown-city"
                             store_id = clean_store_id(row["STORE ID"])
                             store_name = clean_store_name(row["STORE NAME"])
                             record_id = clean_generic(row["ID"])
@@ -186,6 +247,9 @@ if uploaded_file is not None and username and password:
                             dest_name = f"{city}_{store_id}_{store_name}_{record_id}"
                             tasks.append((url, dest_name, city_folder, city))
 
+                        if skipped_rows:
+                            st.warning(f"Skipped {skipped_rows} row(s) with missing/invalid PEP LINK.")
+
                         if not tasks:
                             st.warning("No valid URLs found to download.")
                             st.stop()
@@ -195,36 +259,39 @@ if uploaded_file is not None and username and password:
                         results = []
                         total = len(tasks)
                         done = 0
+                        update_every = max(1, total // 100)  # avoid excessive UI churn on huge batches
 
                         with ThreadPoolExecutor(max_workers=concurrency) as executor:
                             future_to_task = {
                                 executor.submit(
                                     download_one,
+                                    session,
                                     url,
                                     dest_name,
                                     city_folder,
-                                    auth,
                                     timeout,
-                                    max_retries,
-                                ): (url, city)
+                                ): (url, city, dest_name)
                                 for url, dest_name, city_folder, city in tasks
                             }
 
                             for future in as_completed(future_to_task):
-                                url, city = future_to_task[future]
+                                url, city, dest_name = future_to_task[future]
                                 try:
-                                    success, final_name, error = future.result(timeout=timeout + 10)
+                                    success, final_name, error = future.result(timeout=timeout + 15)
                                 except Exception as e:
                                     success, final_name, error = False, None, str(e)
 
                                 done += 1
-                                progress_bar.progress(done / total)
-                                status_text.text(f"Downloading {done}/{total} images...")
+                                if done % update_every == 0 or done == total:
+                                    progress_bar.progress(done / total)
+                                    status_text.text(f"Downloading {done}/{total} images...")
 
                                 if success:
-                                    results.append((url, os.path.join(city, final_name), True, None))
+                                    results.append((url, city, True, None))
                                 else:
-                                    results.append((url, None, False, error))
+                                    results.append((url, city, False, error))
+
+                        session.close()
 
                         succ = sum(1 for r in results if r[2])
                         fail = sum(1 for r in results if not r[2])
@@ -233,25 +300,26 @@ if uploaded_file is not None and username and password:
                         st.success(f"Download complete! Successful: {succ}, Failed: {fail}")
 
                         if succ > 0:
-                            zip_buffer = BytesIO()
-                            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
-                                for _, fname, ok, _ in results:
-                                    if ok and fname:
-                                        fpath = os.path.join(download_folder, fname)
-                                        if os.path.exists(fpath):
-                                            arcname = os.path.relpath(fpath, download_folder)
-                                            zipf.write(fpath, arcname)
-
-                            st.session_state.zip_data = {
-                                "bytes": zip_buffer.getvalue(),
-                                "file_name": f"{safe_folder_name}.zip",
-                            }
+                            # Build one ZIP per city so memory use stays bounded
+                            # even when there are thousands of images overall.
+                            city_zips = {}
+                            cities = sorted({r[1] for r in results if r[2]})
+                            for city in cities:
+                                city_folder = os.path.join(download_folder, city)
+                                if os.path.isdir(city_folder) and os.listdir(city_folder):
+                                    zip_bytes = zip_folder_to_bytes(city_folder)
+                                    city_zips[city] = {
+                                        "bytes": zip_bytes,
+                                        "file_name": f"{safe_folder_name}_{city}.zip",
+                                    }
+                            st.session_state.city_zips = city_zips
 
                         if fail > 0:
-                            failed_data = []
-                            for url, _, ok, error in results:
-                                if not ok:
-                                    failed_data.append({"url": url, "error": error})
+                            failed_data = [
+                                {"url": url, "city": city, "error": error}
+                                for url, city, ok, error in results
+                                if not ok
+                            ]
                             fail_df = pd.DataFrame(failed_data)
                             st.session_state.failed_csv_data = fail_df.to_csv(index=False).encode("utf-8")
 
@@ -261,16 +329,19 @@ if uploaded_file is not None and username and password:
 
         if st.session_state.download_summary:
             succ, fail = st.session_state.download_summary
-            st.success(f"Ready to download. Successful: {succ}, Failed: {fail}")
+            st.info(f"Last run — Successful: {succ}, Failed: {fail}")
 
-        if st.session_state.zip_data:
-            st.download_button(
-                "Download All Images (ZIP)",
-                data=st.session_state.zip_data["bytes"],
-                file_name=st.session_state.zip_data["file_name"],
-                mime="application/zip",
-                use_container_width=True,
-            )
+        if st.session_state.city_zips:
+            st.markdown("### Download ZIPs (one per city)")
+            for city, data in st.session_state.city_zips.items():
+                st.download_button(
+                    f"Download {city} ({data['file_name']})",
+                    data=data["bytes"],
+                    file_name=data["file_name"],
+                    mime="application/zip",
+                    use_container_width=True,
+                    key=f"zip_{city}",
+                )
 
         if st.session_state.failed_csv_data:
             st.download_button(
