@@ -18,23 +18,24 @@ import filetype
 # -------------------------------------------------------
 
 def clean_generic(s):
-    """General cleaner: keep letters/numbers/dash, drop everything else (spaces removed)."""
+    """General cleaner: keep letters/numbers/dash/dot, drop everything else (spaces removed).
+    Keeps values like '8.RWP' intact instead of mangling them to '8RWP'."""
     s = str(s).strip()
-    return "".join(c for c in s if c.isalnum() or c == '-')
+    return "".join(c for c in s if c.isalnum() or c in ('-', '.'))
 
 
 def clean_store_id(s):
     """STORE ID may already contain dashes -> keep them exactly as-is.
-    Only strip characters that are not alnum/dash (e.g. stray spaces, slashes)."""
+    Only strip characters that are not alnum/dash/dot (e.g. stray spaces, slashes)."""
     s = str(s).strip()
-    return "".join(c for c in s if c.isalnum() or c == '-')
+    return "".join(c for c in s if c.isalnum() or c in ('-', '.'))
 
 
 def clean_store_name(s):
-    """STORE NAME: replace spaces with a dash, keep alnum/dash only."""
+    """STORE NAME: replace spaces with a dash, keep alnum/dash/dot only."""
     s = str(s).strip()
     s = re.sub(r'\s+', '-', s)
-    return "".join(c for c in s if c.isalnum() or c == '-')
+    return "".join(c for c in s if c.isalnum() or c in ('-', '.'))
 
 
 def detect_extension(content, content_type, url):
