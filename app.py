@@ -131,19 +131,18 @@ def download_one(session, url, dest_name, folder, timeout=30):
 
 
 def zip_folder_to_bytes(folder_path):
-    """Zip a folder's contents into an in-memory buffer and return the bytes."""
+    """Zip a folder's contents (flat, no subfolders) into an in-memory buffer."""
     buf = BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for root, _dirs, files in os.walk(folder_path):
-            for fname in files:
-                fpath = os.path.join(root, fname)
-                arcname = os.path.relpath(fpath, folder_path)
-                zipf.write(fpath, arcname)
+        for fname in sorted(os.listdir(folder_path)):
+            fpath = os.path.join(folder_path, fname)
+            if os.path.isfile(fpath):
+                zipf.write(fpath, fname)
     return buf.getvalue()
 
 
 def reset_download_state():
-    st.session_state.city_zips = None
+    st.session_state.zip_data = None
     st.session_state.failed_csv_data = None
     st.session_state.download_summary = None
 
@@ -162,14 +161,7 @@ with st.sidebar:
     st.write("Image file name pattern: `CITY_STOREID_STORE-NAME_ID`")
     st.write("- STORE NAME: spaces become dashes (e.g. `Al Fateh Store` -> `Al-Fateh-Store`)")
     st.write("- STORE ID: kept exactly as-is")
-    st.markdown("---")
-    st.markdown(
-        "**Why one ZIP per city?**\n\n"
-        "For large files lists, building a single giant ZIP holds every image "
-        "in memory at once and can crash the app. Splitting into one ZIP per "
-        "city keeps memory usage bounded and lets you download results for "
-        "cities that finished even if something goes wrong with another one."
-    )
+
 
 username = st.text_input("Kobo Username", "")
 password = st.text_input("Kobo Password", type="password")
@@ -189,8 +181,8 @@ uploaded_file = st.file_uploader(
 
 REQUIRED_COLS = ["PEP LINK", "CITY", "STORE ID", "STORE NAME", "ID"]
 
-if "city_zips" not in st.session_state:
-    st.session_state.city_zips = None
+if "zip_data" not in st.session_state:
+    st.session_state.zip_data = None
 if "failed_csv_data" not in st.session_state:
     st.session_state.failed_csv_data = None
 if "download_summary" not in st.session_state:
@@ -241,11 +233,8 @@ if uploaded_file is not None and username and password:
                             store_name = clean_store_name(row["STORE NAME"])
                             record_id = clean_generic(row["ID"])
 
-                            city_folder = os.path.join(download_folder, city)
-                            os.makedirs(city_folder, exist_ok=True)
-
                             dest_name = f"{city}_{store_id}_{store_name}_{record_id}"
-                            tasks.append((url, dest_name, city_folder, city))
+                            tasks.append((url, dest_name, download_folder, city))
 
                         if skipped_rows:
                             st.warning(f"Skipped {skipped_rows} row(s) with missing/invalid PEP LINK.")
@@ -300,19 +289,11 @@ if uploaded_file is not None and username and password:
                         st.success(f"Download complete! Successful: {succ}, Failed: {fail}")
 
                         if succ > 0:
-                            # Build one ZIP per city so memory use stays bounded
-                            # even when there are thousands of images overall.
-                            city_zips = {}
-                            cities = sorted({r[1] for r in results if r[2]})
-                            for city in cities:
-                                city_folder = os.path.join(download_folder, city)
-                                if os.path.isdir(city_folder) and os.listdir(city_folder):
-                                    zip_bytes = zip_folder_to_bytes(city_folder)
-                                    city_zips[city] = {
-                                        "bytes": zip_bytes,
-                                        "file_name": f"{safe_folder_name}_{city}.zip",
-                                    }
-                            st.session_state.city_zips = city_zips
+                            zip_bytes = zip_folder_to_bytes(download_folder)
+                            st.session_state.zip_data = {
+                                "bytes": zip_bytes,
+                                "file_name": f"{safe_folder_name}.zip",
+                            }
 
                         if fail > 0:
                             failed_data = [
@@ -331,17 +312,14 @@ if uploaded_file is not None and username and password:
             succ, fail = st.session_state.download_summary
             st.info(f"Last run — Successful: {succ}, Failed: {fail}")
 
-        if st.session_state.city_zips:
-            st.markdown("### Download ZIPs (one per city)")
-            for city, data in st.session_state.city_zips.items():
-                st.download_button(
-                    f"Download {city} ({data['file_name']})",
-                    data=data["bytes"],
-                    file_name=data["file_name"],
-                    mime="application/zip",
-                    use_container_width=True,
-                    key=f"zip_{city}",
-                )
+        if st.session_state.zip_data:
+            st.download_button(
+                "Download All Images (ZIP)",
+                data=st.session_state.zip_data["bytes"],
+                file_name=st.session_state.zip_data["file_name"],
+                mime="application/zip",
+                use_container_width=True,
+            )
 
         if st.session_state.failed_csv_data:
             st.download_button(
